@@ -1,20 +1,20 @@
 # cc-goto-work
 
-A Claude Code hook that detects `RESOURCE_EXHAUSTED` errors and automatically instructs Claude to continue working.
+一个 Claude Code hook，用于检测 `RESOURCE_EXHAUSTED` 错误并自动让 Claude 继续工作。
 
-## What it does
+## 功能说明
 
-When Claude Code stops due to a `RESOURCE_EXHAUSTED` error (typically caused by API rate limits), this hook:
+当 Claude Code 因 `RESOURCE_EXHAUSTED` 错误（通常由 API 速率限制引起）停止时，此 hook 会：
 
-1. Detects the error in the conversation transcript
-2. Waits for a configurable amount of time (default: 30 seconds)
-3. Instructs Claude to continue working on the task
+1. 检测对话记录中的错误
+2. 等待可配置的时间（默认：30 秒）
+3. 指示 Claude 继续处理任务
 
-This prevents you from having to manually restart Claude when hitting rate limits during long-running tasks.
+这样您就不必在长时间运行的任务中遇到速率限制时手动重启 Claude。
 
-## Installation
+## 安装
 
-### Quick Install (Recommended)
+### 快速安装（推荐）
 
 **Linux / macOS:**
 ```bash
@@ -26,24 +26,24 @@ curl -fsSL https://raw.githubusercontent.com/pdxxxx/cc-goto-work/main/install.sh
 irm https://raw.githubusercontent.com/pdxxxx/cc-goto-work/main/install.ps1 | iex
 ```
 
-### Manual Installation
+### 手动安装
 
-1. Download the appropriate binary from [Releases](https://github.com/pdxxxx/cc-goto-work/releases):
+1. 从 [Releases](https://github.com/pdxxxx/cc-goto-work/releases) 下载对应平台的二进制文件：
    - `cc-goto-work-linux-amd64` - Linux x86_64
    - `cc-goto-work-linux-arm64` - Linux ARM64
    - `cc-goto-work-windows-amd64.exe` - Windows x86_64
    - `cc-goto-work-macos-amd64` - macOS x86_64 (Intel)
    - `cc-goto-work-macos-arm64` - macOS ARM64 (Apple Silicon)
 
-2. Place the binary in a directory of your choice (e.g., `~/.local/bin/` or `C:\Users\<username>\bin\`)
+2. 将二进制文件放置在您选择的目录中（例如 `~/.local/bin/` 或 `C:\Users\<用户名>\bin\`）
 
-3. Add the hook configuration to your Claude Code settings file:
+3. 将 hook 配置添加到 Claude Code 设置文件中：
 
-   **Location:**
-   - User settings: `~/.claude/settings.json`
-   - Project settings: `.claude/settings.json`
+   **文件位置：**
+   - 用户设置：`~/.claude/settings.json`
+   - 项目设置：`.claude/settings.json`
 
-   **Configuration:**
+   **配置内容：**
    ```json
    {
      "hooks": {
@@ -62,22 +62,22 @@ irm https://raw.githubusercontent.com/pdxxxx/cc-goto-work/main/install.ps1 | iex
    }
    ```
 
-## Usage
+## 使用方法
 
-### Command Line Options
+### 命令行选项
 
 ```
-cc-goto-work [OPTIONS]
+cc-goto-work [选项]
 
-OPTIONS:
-    -w, --wait <SECONDS>    Wait time before continuing (default: 30)
-    -h, --help              Print help information
-    -V, --version           Print version information
+选项：
+    -w, --wait <秒数>    继续之前的等待时间（默认：30）
+    -h, --help           显示帮助信息
+    -V, --version        显示版本信息
 ```
 
-### Examples
+### 配置示例
 
-**Use default wait time (30 seconds):**
+**使用默认等待时间（30 秒）：**
 ```json
 {
   "hooks": {
@@ -95,7 +95,7 @@ OPTIONS:
 }
 ```
 
-**Custom wait time (60 seconds):**
+**自定义等待时间（60 秒）：**
 ```json
 {
   "hooks": {
@@ -113,7 +113,7 @@ OPTIONS:
 }
 ```
 
-**No wait time:**
+**不等待：**
 ```json
 {
   "hooks": {
@@ -131,28 +131,28 @@ OPTIONS:
 }
 ```
 
-## How it works
+## 工作原理
 
-1. When Claude Code triggers a Stop event, this hook receives the event data via stdin
-2. The hook reads the conversation transcript file to check for `RESOURCE_EXHAUSTED` errors
-3. If detected, it waits for the configured time and returns a JSON response instructing Claude to continue
-4. If not detected, it allows the stop to proceed normally
+1. 当 Claude Code 触发 Stop 事件时，此 hook 通过 stdin 接收事件数据
+2. Hook 读取对话记录文件以检查 `RESOURCE_EXHAUSTED` 错误
+3. 如果检测到错误，等待配置的时间后返回 JSON 响应，指示 Claude 继续工作
+4. 如果未检测到错误，允许正常停止
 
-The hook also includes protection against infinite loops via the `stop_hook_active` flag.
+Hook 支持多次重试 —— 只要检测到 `RESOURCE_EXHAUSTED` 错误，就会等待并重试，等待时间机制可防止快速循环。
 
-## Building from source
+## 从源码构建
 
 ```bash
-# Clone the repository
+# 克隆仓库
 git clone https://github.com/pdxxxx/cc-goto-work.git
 cd cc-goto-work
 
-# Build release binary
+# 构建 release 版本
 cargo build --release
 
-# Binary will be at target/release/cc-goto-work
+# 二进制文件位于 target/release/cc-goto-work
 ```
 
-## License
+## 许可证
 
-MIT License - see [LICENSE](LICENSE) for details.
+MIT License - 详见 [LICENSE](LICENSE)。
