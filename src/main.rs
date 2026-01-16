@@ -8,6 +8,10 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process;
+use std::thread;
+use std::time::Duration;
+
+const DEFAULT_WAIT_SECONDS: u64 = 30;
 
 /// Input received from Claude Code via stdin
 #[derive(Debug, Deserialize)]
@@ -42,14 +46,56 @@ struct TranscriptMessage {
     stop_reason: Option<String>,
 }
 
+/// Parse command line arguments to get wait time
+fn parse_args() -> u64 {
+    let args: Vec<String> = std::env::args().collect();
+    let mut wait_seconds = DEFAULT_WAIT_SECONDS;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--wait" | "-w" => {
+                if i + 1 < args.len() {
+                    if let Ok(secs) = args[i + 1].parse::<u64>() {
+                        wait_seconds = secs;
+                    }
+                    i += 1;
+                }
+            }
+            "--help" | "-h" => {
+                println!("cc-goto-work - Claude Code RESOURCE_EXHAUSTED Hook");
+                println!();
+                println!("USAGE:");
+                println!("    cc-goto-work [OPTIONS]");
+                println!();
+                println!("OPTIONS:");
+                println!("    -w, --wait <SECONDS>    Wait time before continuing (default: {})", DEFAULT_WAIT_SECONDS);
+                println!("    -h, --help              Print help information");
+                println!("    -V, --version           Print version information");
+                process::exit(0);
+            }
+            "--version" | "-V" => {
+                println!("cc-goto-work {}", env!("CARGO_PKG_VERSION"));
+                process::exit(0);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    wait_seconds
+}
+
 fn main() {
-    if let Err(e) = run() {
+    let wait_seconds = parse_args();
+
+    if let Err(e) = run(wait_seconds) {
         eprintln!("Hook error: {}", e);
         process::exit(1);
     }
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+fn run(wait_seconds: u64) -> Result<(), Box<dyn std::error::Error>> {
     // Read input from stdin
     let mut input_str = String::new();
     io::stdin().read_to_string(&mut input_str)?;
@@ -73,6 +119,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Check if RESOURCE_EXHAUSTED caused the stop
     if is_resource_exhausted(&transcript_path)? {
+        // Wait before continuing to avoid rapid retries
+        if wait_seconds > 0 {
+            thread::sleep(Duration::from_secs(wait_seconds));
+        }
+
         // Block the stop and tell Claude to continue
         let output = HookOutput {
             decision: "block".to_string(),
