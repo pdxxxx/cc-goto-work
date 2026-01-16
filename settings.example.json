@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "D:\\Workspace\\private\\cc-goto-work\\target\\release\\cc-goto-work.exe",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
