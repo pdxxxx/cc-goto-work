@@ -6,8 +6,8 @@
 //! ## Detection Priority (first match wins)
 //! 1. Fatal errors (context exceeded, cost limit) → Allow stop (no retry)
 //! 2. stop_reason boundary (max_tokens → Block, end_turn → Allow)
-//! 3. Structured error type (RESOURCE_EXHAUSTED, rate_limit, etc.) → Block + Wait
-//! 4. HTTP status codes (429, 503, 529) → Block + Wait
+//! 3. Structured error type (last 5 lines only) → Block + Wait
+//! 4. HTTP status codes (last 5 lines only) → Block + Wait
 //! 5. Raw text fallback (last 8 lines only) → Block + Wait
 
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,8 @@ use std::time::Duration;
 const DEFAULT_WAIT_SECONDS: u64 = 30;
 /// Read approximately last 10KB of transcript for efficiency
 const TAIL_READ_BYTES: u64 = 10 * 1024;
+/// Only check last N lines for structured error detection to avoid false positives from old errors
+const RECENT_ERROR_LINES: usize = 5;
 /// Only check last N lines for raw text fallback to reduce false positives
 const RAW_FALLBACK_LINES: usize = 8;
 
@@ -259,7 +261,9 @@ fn extract_stop_reason(value: &serde_json::Value) -> Option<&str> {
 
 /// Detect structured error type in JSON
 fn detect_structured_error(lines: &[TranscriptLine], _stop_hook_active: bool) -> DetectionOutcome {
-    for line in lines.iter().rev() {
+    // Only check the last N lines to avoid triggering on old historical errors
+    let start = lines.len().saturating_sub(RECENT_ERROR_LINES);
+    for line in lines[start..].iter().rev() {
         let json = match &line.json {
             Some(v) => v,
             None => continue,
@@ -321,7 +325,9 @@ fn classify_error_message(msg: &str) -> Option<StopCause> {
 
 /// Detect HTTP status codes indicating transient errors
 fn detect_http_status(lines: &[TranscriptLine], _stop_hook_active: bool) -> DetectionOutcome {
-    for line in lines.iter().rev() {
+    // Only check the last N lines to avoid triggering on old historical errors
+    let start = lines.len().saturating_sub(RECENT_ERROR_LINES);
+    for line in lines[start..].iter().rev() {
         let json = match &line.json {
             Some(v) => v,
             None => continue,
@@ -770,6 +776,32 @@ mod tests {
         }
         // The error should be outside the window now
         assert_eq!(detect_raw_fallback(&lines, false), DetectionOutcome::NoMatch);
+    }
+
+    #[test]
+    fn structured_error_ignores_old_lines() {
+        let mut lines = vec![line(
+            r#"{"type":"error","error":{"type":"RESOURCE_EXHAUSTED"}}"#,
+        )];
+        // Add enough normal lines to push the error out of the detection window
+        for _ in 0..RECENT_ERROR_LINES {
+            lines.push(line(r#"{"type":"user","message":{"content":"hello"}}"#));
+        }
+        // The error should be outside the window now
+        assert_eq!(detect_structured_error(&lines, false), DetectionOutcome::NoMatch);
+    }
+
+    #[test]
+    fn http_status_ignores_old_lines() {
+        let mut lines = vec![line(
+            r#"{"type":"error","status":429,"message":"Rate limited"}"#,
+        )];
+        // Add enough normal lines to push the error out of the detection window
+        for _ in 0..RECENT_ERROR_LINES {
+            lines.push(line(r#"{"type":"user","message":{"content":"hello"}}"#));
+        }
+        // The error should be outside the window now
+        assert_eq!(detect_http_status(&lines, false), DetectionOutcome::NoMatch);
     }
 
     // ========== Integration Tests ==========
