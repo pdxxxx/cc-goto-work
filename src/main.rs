@@ -102,12 +102,6 @@ fn run(wait_seconds: u64) -> Result<(), Box<dyn std::error::Error>> {
 
     let input: HookInput = serde_json::from_str(&input_str)?;
 
-    // Prevent infinite loops - if stop_hook_active is true, allow stop
-    if input.stop_hook_active.unwrap_or(false) {
-        // Exit 0 without output = allow stop
-        return Ok(());
-    }
-
     // Get transcript path
     let transcript_path = match &input.transcript_path {
         Some(path) => expand_path(path),
@@ -118,6 +112,9 @@ fn run(wait_seconds: u64) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Check if RESOURCE_EXHAUSTED caused the stop
+    // Note: We intentionally ignore stop_hook_active flag for RESOURCE_EXHAUSTED errors
+    // because we want to keep retrying even after previous retries.
+    // This is safe because we have a wait time that prevents rapid loops.
     if is_resource_exhausted(&transcript_path)? {
         // Wait before continuing to avoid rapid retries
         if wait_seconds > 0 {
