@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "D:\\Workspace\\private\\cc-goto-work\\target\\release\\cc-goto-work.exe",
+            "command": "~/.local/bin/cc-goto-work --wait 30",
             "timeout": 60
           }
         ]
