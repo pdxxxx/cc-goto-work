@@ -6,16 +6,17 @@
 $ErrorActionPreference = "Stop"
 
 $REPO = "pdxxxx/cc-goto-work"
-$INSTALL_DIR = "$env:USERPROFILE\.local\bin"
+$INSTALL_DIR = "$env:USERPROFILE\.claude\cc-goto-work"
+$CONFIG_FILE = "$INSTALL_DIR\config.yaml"
 $CLAUDE_SETTINGS_DIR = "$env:USERPROFILE\.claude"
 $CLAUDE_SETTINGS_FILE = "$CLAUDE_SETTINGS_DIR\settings.json"
 
 function Write-Banner {
     Write-Host ""
-    Write-Host "╔═══════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-    Write-Host "║           cc-goto-work Installer                          ║" -ForegroundColor Cyan
-    Write-Host "║   Claude Code RESOURCE_EXHAUSTED Auto-Continue Hook       ║" -ForegroundColor Cyan
-    Write-Host "╚═══════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host "           cc-goto-work Installer                           " -ForegroundColor Cyan
+    Write-Host "   Claude Code AI-based Session Detector Hook               " -ForegroundColor Cyan
+    Write-Host "============================================================" -ForegroundColor Cyan
     Write-Host ""
 }
 
@@ -113,11 +114,43 @@ function Install-Binary {
     return $destPath
 }
 
-function Set-ClaudeSettings {
+function New-ConfigFile {
     param(
-        [string]$BinaryPath,
-        [int]$WaitTime
+        [string]$ApiBase,
+        [string]$ApiKey,
+        [string]$Model
     )
+
+    Write-Step "Creating config file..."
+
+    $configContent = @"
+# cc-goto-work configuration
+# https://github.com/pdxxxx/cc-goto-work
+
+# OpenAI compatible API base URL
+api_base: $ApiBase
+
+# API key for authentication
+api_key: $ApiKey
+
+# Model name to use
+model: $Model
+
+# Request timeout in seconds (optional)
+timeout: 30
+
+# Custom system prompt (optional)
+# Uncomment and modify to customize AI behavior
+# system_prompt: |
+#   You are a supervisor for an AI coding agent...
+"@
+
+    $configContent | Set-Content $CONFIG_FILE -Encoding UTF8
+    Write-Step "Config file created at $CONFIG_FILE"
+}
+
+function Set-ClaudeSettings {
+    param([string]$BinaryPath)
 
     Write-Step "Configuring Claude Code settings..."
 
@@ -126,10 +159,6 @@ function Set-ClaudeSettings {
         New-Item -ItemType Directory -Path $CLAUDE_SETTINGS_DIR -Force | Out-Null
     }
 
-    # Escape backslashes for JSON
-    $escapedPath = $BinaryPath -replace '\\', '\\\\'
-    $hookCommand = "$escapedPath --wait $WaitTime"
-
     $newSettings = @{
         hooks = @{
             Stop = @(
@@ -137,7 +166,7 @@ function Set-ClaudeSettings {
                     hooks = @(
                         @{
                             type = "command"
-                            command = "$BinaryPath --wait $WaitTime"
+                            command = $BinaryPath
                             timeout = 120
                         }
                     )
@@ -162,7 +191,7 @@ function Set-ClaudeSettings {
                 Write-Host "Please manually update the hook configuration:"
                 Write-Host ""
                 Write-Host "Command to use: " -NoNewline
-                Write-Host "$BinaryPath --wait $WaitTime" -ForegroundColor Yellow
+                Write-Host $BinaryPath -ForegroundColor Yellow
                 Write-Host ""
                 return
             }
@@ -182,7 +211,7 @@ function Set-ClaudeSettings {
             } else {
                 Write-Host ""
                 Write-Host "Please manually add the hook configuration to $CLAUDE_SETTINGS_FILE"
-                Show-ManualConfig -BinaryPath $BinaryPath -WaitTime $WaitTime
+                Show-ManualConfig -BinaryPath $BinaryPath
                 return
             }
         }
@@ -195,10 +224,7 @@ function Set-ClaudeSettings {
 }
 
 function Show-ManualConfig {
-    param(
-        [string]$BinaryPath,
-        [int]$WaitTime
-    )
+    param([string]$BinaryPath)
 
     $escapedPath = $BinaryPath -replace '\\', '\\\\'
 
@@ -213,7 +239,7 @@ function Show-ManualConfig {
         "hooks": [
           {
             "type": "command",
-            "command": "$escapedPath --wait $WaitTime",
+            "command": "$escapedPath",
             "timeout": 120
           }
         ]
@@ -222,29 +248,6 @@ function Show-ManualConfig {
   }
 }
 "@
-}
-
-function Add-ToPath {
-    param([string]$Directory)
-
-    $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
-
-    if ($currentPath -notlike "*$Directory*") {
-        Write-Warning "$Directory is not in your PATH"
-        Write-Host ""
-
-        if (Read-YesNo "Add to user PATH?" "y") {
-            $newPath = "$currentPath;$Directory"
-            [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
-            Write-Step "Added to PATH. Please restart your terminal for changes to take effect."
-        } else {
-            Write-Host ""
-            Write-Host "To add manually, run:" -ForegroundColor Yellow
-            Write-Host ""
-            Write-Host "    `$env:Path += `";$Directory`"" -ForegroundColor Cyan
-            Write-Host ""
-        }
-    }
 }
 
 function Main {
@@ -273,36 +276,50 @@ function Main {
 
     Write-Host ""
 
-    # Ask for installation directory
-    $INSTALL_DIR = Read-Input "Installation directory" $INSTALL_DIR
-
-    # Ask for wait time
-    $waitTime = Read-Input "Wait time in seconds before retry" "30"
-    $waitTimeInt = [int]$waitTime
-
-    Write-Host ""
+    # Create installation directory
+    if (-not (Test-Path $INSTALL_DIR)) {
+        New-Item -ItemType Directory -Path $INSTALL_DIR -Force | Out-Null
+    }
 
     # Download binary
     $binaryPath = Install-Binary -Version $version -DestDir $INSTALL_DIR
 
     Write-Host ""
 
-    # Configure settings
-    if (Read-YesNo "Configure Claude Code settings automatically?" "y") {
-        Set-ClaudeSettings -BinaryPath $binaryPath -WaitTime $waitTimeInt
-    } else {
-        Show-ManualConfig -BinaryPath $binaryPath -WaitTime $waitTimeInt
+    # Configure API settings
+    Write-Step "Configuring AI settings..."
+    Write-Host ""
+    Write-Host "This hook uses an AI model to detect incomplete sessions."
+    Write-Host "You need to provide an OpenAI-compatible API endpoint."
+    Write-Host ""
+
+    $apiBase = Read-Input "API base URL" "https://api.openai.com/v1"
+    $apiKey = Read-Input "API key" ""
+    $model = Read-Input "Model name" "gpt-4o-mini"
+
+    if ([string]::IsNullOrWhiteSpace($apiKey)) {
+        Write-Warning "No API key provided. You'll need to edit $CONFIG_FILE before using."
     }
 
     Write-Host ""
 
-    # Check PATH
-    Add-ToPath -Directory $INSTALL_DIR
+    # Create config file
+    New-ConfigFile -ApiBase $apiBase -ApiKey $apiKey -Model $model
+
+    Write-Host ""
+
+    # Configure settings
+    if (Read-YesNo "Configure Claude Code settings automatically?" "y") {
+        Set-ClaudeSettings -BinaryPath $binaryPath
+    } else {
+        Show-ManualConfig -BinaryPath $binaryPath
+    }
 
     Write-Host ""
     Write-Host "Installation complete!" -ForegroundColor Green
     Write-Host ""
     Write-Host "Binary installed to: $binaryPath"
+    Write-Host "Config file: $CONFIG_FILE"
     Write-Host "Settings file: $CLAUDE_SETTINGS_FILE"
     Write-Host ""
     Write-Host "Restart Claude Code for the hook to take effect."

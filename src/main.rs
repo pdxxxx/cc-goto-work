@@ -1,34 +1,78 @@
-//! Claude Code Stop Hook - Interruption Detector
+//! Claude Code Stop Hook - AI-based Session Detector
 //!
-//! This hook detects common interruption causes from the Claude Code transcript JSONL
-//! and instructs Claude to continue when appropriate.
+//! This hook uses an AI model (OpenAI-compatible API) to analyze Claude Code
+//! transcripts and determine if the session should continue or stop.
 //!
-//! ## Detection Priority (first match wins)
-//! 1. Fatal errors (context exceeded, cost limit) → Allow stop (no retry)
-//! 2. stop_reason boundary (max_tokens → Block, end_turn → Allow)
-//! 3. Structured error type (last 5 lines only) → Block + Wait
-//! 4. HTTP status codes (last 5 lines only) → Block + Wait
-//! 5. Raw text fallback (last 8 lines only) → Block + Wait
+//! ## Configuration
+//! All settings are read from a YAML config file.
+//! Default path: ~/.claude/cc-goto-work/config.yaml
 
+use clap::Parser;
 use serde::{Deserialize, Serialize};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::process;
-use std::thread;
 use std::time::Duration;
 
 // ============================================================================
 // Constants
 // ============================================================================
 
-const DEFAULT_WAIT_SECONDS: u64 = 30;
+/// Default config file path
+const DEFAULT_CONFIG_PATH: &str = "~/.claude/cc-goto-work/config.yaml";
 /// Read approximately last 10KB of transcript for efficiency
 const TAIL_READ_BYTES: u64 = 10 * 1024;
-/// Only check last N lines for structured error detection to avoid false positives from old errors
-const RECENT_ERROR_LINES: usize = 5;
-/// Only check last N lines for raw text fallback to reduce false positives
-const RAW_FALLBACK_LINES: usize = 8;
+/// Maximum number of transcript lines to send to AI
+const AI_MAX_LINES: usize = 20;
+/// Default API request timeout in seconds
+const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
+
+// ============================================================================
+// CLI Arguments
+// ============================================================================
+
+#[derive(Parser, Debug)]
+#[command(name = "cc-goto-work")]
+#[command(about = "Claude Code Stop Hook - AI-based session detector")]
+#[command(version)]
+struct Args {
+    /// Path to config file
+    #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
+    config: String,
+}
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+struct Config {
+    /// OpenAI compatible API base URL
+    api_base: String,
+    /// API key for authentication
+    api_key: String,
+    /// Model name to use
+    model: String,
+    /// Request timeout in seconds (optional, default: 30)
+    #[serde(default = "default_timeout")]
+    timeout: u64,
+    /// Custom system prompt (optional)
+    #[serde(default)]
+    system_prompt: Option<String>,
+}
+
+fn default_timeout() -> u64 {
+    DEFAULT_TIMEOUT_SECONDS
+}
+
+impl Config {
+    fn load(path: &PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+        let content = fs::read_to_string(path)?;
+        let config: Config = serde_yaml::from_str(&content)?;
+        Ok(config)
+    }
+}
 
 // ============================================================================
 // Data Structures
@@ -42,7 +86,6 @@ struct HookInput {
     transcript_path: Option<String>,
     cwd: Option<String>,
     hook_event_name: Option<String>,
-    /// Indicates if a previous stop hook already intervened in this session
     stop_hook_active: Option<bool>,
 }
 
@@ -53,370 +96,29 @@ struct HookOutput {
     reason: String,
 }
 
-/// Internal action to take after detection
-#[derive(Debug)]
-struct HookAction {
-    wait_seconds: u64,
-    output: HookOutput,
-}
-
 /// A parsed line from the transcript
 #[derive(Debug, Clone)]
 struct TranscriptLine {
+    #[allow(dead_code)]
     raw: String,
     json: Option<serde_json::Value>,
 }
 
 // ============================================================================
-// Stop Cause Classification
+// AI Response
 // ============================================================================
 
-/// Represents the detected cause of interruption
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StopCause {
-    // Retryable causes (Block + Wait)
-    /// Output truncated due to max_tokens limit
-    MaxTokens,
-    /// API resource exhausted (quota/overload)
-    ResourceExhausted,
-    /// HTTP 429 rate limit
-    RateLimited,
-    /// Server overload (HTTP 503/529)
-    Overloaded,
-    /// Network or service unavailable
-    Unavailable,
-
-    // Non-retryable causes (Allow stop)
-    /// Context window exceeded - retrying won't help
-    ContextLengthExceeded,
-    /// Cost/spending limit reached - must not retry
-    CostLimitReached,
-}
-
-impl StopCause {
-    /// Returns true if this error is transient and can be retried
-    fn is_retryable(self) -> bool {
-        matches!(
-            self,
-            StopCause::MaxTokens
-                | StopCause::ResourceExhausted
-                | StopCause::RateLimited
-                | StopCause::Overloaded
-                | StopCause::Unavailable
-        )
-    }
-
-    /// Returns the wait time before retrying (0 for max_tokens, configured for others)
-    fn wait_seconds(self, configured: u64) -> u64 {
-        match self {
-            StopCause::MaxTokens => 0, // No wait needed, just continue output
-            _ if self.is_retryable() => configured,
-            _ => 0,
-        }
-    }
-
-    /// Returns a human-readable reason for the hook decision
-    fn reason(self) -> &'static str {
-        match self {
-            StopCause::MaxTokens => {
-                "Detected stop_reason=max_tokens. Please continue output from where you left off."
-            }
-            StopCause::ResourceExhausted => {
-                "Detected retryable API error (RESOURCE_EXHAUSTED). Please continue working."
-            }
-            StopCause::RateLimited => {
-                "Detected API rate limit (HTTP 429). Please continue working after wait."
-            }
-            StopCause::Overloaded => {
-                "Detected server overload (HTTP 503/529). Please continue working after wait."
-            }
-            StopCause::Unavailable => {
-                "Detected network/service unavailability. Please continue working after wait."
-            }
-            StopCause::ContextLengthExceeded => {
-                "Context length exceeded. Cannot retry - please use /compact to reduce context."
-            }
-            StopCause::CostLimitReached => {
-                "Cost/spending limit reached. Cannot retry - please check your budget settings."
-            }
-        }
-    }
-}
-
-// ============================================================================
-// Detection Outcome
-// ============================================================================
-
-/// Result of running a detector
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DetectionOutcome {
-    /// Allow the stop (do not block)
-    Allow,
-    /// Block the stop and retry with given cause
-    Block(StopCause),
-    /// No match, continue to next detector
-    NoMatch,
-}
-
-// ============================================================================
-// Detector Functions
-// ============================================================================
-
-/// Detector function type
-type DetectorFn = fn(&[TranscriptLine], bool) -> DetectionOutcome;
-
-/// Ordered list of detectors (priority order)
-const DETECTORS: &[DetectorFn] = &[
-    detect_fatal_errors,        // Must be first to prevent infinite loops
-    detect_stop_reason_boundary,
-    detect_structured_error,
-    detect_http_status,
-    detect_raw_fallback,
-];
-
-/// Detect fatal errors that should NEVER be retried
-fn detect_fatal_errors(lines: &[TranscriptLine], _stop_hook_active: bool) -> DetectionOutcome {
-    for line in lines.iter().rev() {
-        // Check structured JSON first
-        if let Some(json) = &line.json {
-            if let Some(cause) = classify_fatal_error_json(json) {
-                return DetectionOutcome::Block(cause);
-            }
-        }
-        // Check raw text for fatal patterns
-        if let Some(cause) = classify_fatal_error_raw(&line.raw) {
-            return DetectionOutcome::Block(cause);
-        }
-    }
-    DetectionOutcome::NoMatch
-}
-
-fn classify_fatal_error_json(value: &serde_json::Value) -> Option<StopCause> {
-    // Check error.type field
-    if let Some(error_type) = value.pointer("/error/type").and_then(|v| v.as_str()) {
-        let t = error_type.to_ascii_lowercase();
-        if t.contains("context_length") || t.contains("context_window") {
-            return Some(StopCause::ContextLengthExceeded);
-        }
-    }
-    // Check error.message for cost limit
-    if let Some(msg) = value.pointer("/error/message").and_then(|v| v.as_str()) {
-        let m = msg.to_ascii_lowercase();
-        if m.contains("cost limit") || m.contains("spending limit") || m.contains("budget") {
-            return Some(StopCause::CostLimitReached);
-        }
-    }
-    None
-}
-
-fn classify_fatal_error_raw(raw: &str) -> Option<StopCause> {
-    let upper = raw.to_ascii_uppercase();
-    if upper.contains("CONTEXT_LENGTH_EXCEEDED") || upper.contains("CONTEXT_WINDOW_EXCEEDED") {
-        return Some(StopCause::ContextLengthExceeded);
-    }
-    if upper.contains("COST_LIMIT") || upper.contains("SPENDING_LIMIT")
-        || raw.to_ascii_lowercase().contains("budget exceeded") {
-        return Some(StopCause::CostLimitReached);
-    }
-    None
-}
-
-/// Detect stop_reason boundary - establishes if this is a normal stop
-fn detect_stop_reason_boundary(lines: &[TranscriptLine], _stop_hook_active: bool) -> DetectionOutcome {
-    for line in lines.iter().rev() {
-        let json = match &line.json {
-            Some(v) => v,
-            None => continue,
-        };
-
-        let stop_reason = match extract_stop_reason(json) {
-            Some(sr) => sr,
-            None => continue,
-        };
-
-        // max_tokens means output was truncated - should continue
-        if stop_reason.eq_ignore_ascii_case("max_tokens") {
-            return DetectionOutcome::Block(StopCause::MaxTokens);
-        }
-        // end_turn means normal completion - allow stop, don't check old errors
-        if stop_reason.eq_ignore_ascii_case("end_turn") || stop_reason.eq_ignore_ascii_case("stop_sequence") {
-            return DetectionOutcome::Allow;
-        }
-        // error means continue checking for specific error types
-        if stop_reason.eq_ignore_ascii_case("error") {
-            return DetectionOutcome::NoMatch;
-        }
-        // Unknown stop_reason - allow by default
-        return DetectionOutcome::Allow;
-    }
-    DetectionOutcome::NoMatch
-}
-
-fn extract_stop_reason(value: &serde_json::Value) -> Option<&str> {
-    value
-        .pointer("/message/stop_reason")
-        .and_then(|v| v.as_str())
-        .or_else(|| value.get("stop_reason").and_then(|v| v.as_str()))
-}
-
-/// Detect structured error type in JSON
-fn detect_structured_error(lines: &[TranscriptLine], _stop_hook_active: bool) -> DetectionOutcome {
-    // Only check the last N lines to avoid triggering on old historical errors
-    let start = lines.len().saturating_sub(RECENT_ERROR_LINES);
-    for line in lines[start..].iter().rev() {
-        let json = match &line.json {
-            Some(v) => v,
-            None => continue,
-        };
-
-        // Only process error-type entries
-        let entry_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        if !entry_type.eq_ignore_ascii_case("error") {
-            continue;
-        }
-
-        // Check error.type field
-        if let Some(error_type) = json.pointer("/error/type").and_then(|v| v.as_str()) {
-            if let Some(cause) = classify_error_type(error_type) {
-                return DetectionOutcome::Block(cause);
-            }
-        }
-
-        // Also check error.message for known patterns
-        if let Some(error_msg) = json.pointer("/error/message").and_then(|v| v.as_str()) {
-            if let Some(cause) = classify_error_message(error_msg) {
-                return DetectionOutcome::Block(cause);
-            }
-        }
-    }
-    DetectionOutcome::NoMatch
-}
-
-fn classify_error_type(error_type: &str) -> Option<StopCause> {
-    let t = error_type.to_ascii_uppercase();
-    if t.contains("RESOURCE_EXHAUSTED") {
-        return Some(StopCause::ResourceExhausted);
-    }
-    if t.contains("RATE_LIMIT") || t.contains("TOO_MANY_REQUESTS") {
-        return Some(StopCause::RateLimited);
-    }
-    if t.contains("OVERLOADED") || t.contains("OVERLOAD") {
-        return Some(StopCause::Overloaded);
-    }
-    if t.contains("UNAVAILABLE") {
-        return Some(StopCause::Unavailable);
-    }
-    None
-}
-
-fn classify_error_message(msg: &str) -> Option<StopCause> {
-    let m = msg.to_ascii_uppercase();
-    if m.contains("RESOURCE_EXHAUSTED") {
-        return Some(StopCause::ResourceExhausted);
-    }
-    if m.contains("RATE LIMIT") || m.contains("TOO MANY REQUESTS") {
-        return Some(StopCause::RateLimited);
-    }
-    if m.contains("OVERLOADED") {
-        return Some(StopCause::Overloaded);
-    }
-    None
-}
-
-/// Detect HTTP status codes indicating transient errors
-fn detect_http_status(lines: &[TranscriptLine], _stop_hook_active: bool) -> DetectionOutcome {
-    // Only check the last N lines to avoid triggering on old historical errors
-    let start = lines.len().saturating_sub(RECENT_ERROR_LINES);
-    for line in lines[start..].iter().rev() {
-        let json = match &line.json {
-            Some(v) => v,
-            None => continue,
-        };
-
-        // Only check error-like entries
-        let is_error = json
-            .get("type")
-            .and_then(|v| v.as_str())
-            .map(|t| t.eq_ignore_ascii_case("error"))
-            .unwrap_or(false)
-            || json.get("error").is_some();
-
-        if !is_error {
-            continue;
-        }
-
-        if let Some(status) = extract_http_status(json) {
-            match status {
-                429 => return DetectionOutcome::Block(StopCause::RateLimited),
-                503 | 529 => return DetectionOutcome::Block(StopCause::Overloaded),
-                _ => {}
-            }
-        }
-    }
-    DetectionOutcome::NoMatch
-}
-
-fn extract_http_status(value: &serde_json::Value) -> Option<i64> {
-    // Check common status field names
-    for key in &["status", "status_code", "http_status", "statusCode"] {
-        if let Some(status) = value.get(*key).and_then(|v| v.as_i64()) {
-            return Some(status);
-        }
-        // Also check inside error object
-        if let Some(status) = value.pointer(&format!("/error/{}", key)).and_then(|v| v.as_i64()) {
-            return Some(status);
-        }
-    }
-    None
-}
-
-/// Raw text fallback for when JSON parsing fails
-fn detect_raw_fallback(lines: &[TranscriptLine], _stop_hook_active: bool) -> DetectionOutcome {
-    // Only check the last N lines to reduce false positives
-    let start = lines.len().saturating_sub(RAW_FALLBACK_LINES);
-    for line in lines[start..].iter().rev() {
-        // Skip if JSON was successfully parsed (already handled)
-        if line.json.is_some() {
-            continue;
-        }
-        if let Some(cause) = classify_raw_text(&line.raw) {
-            return DetectionOutcome::Block(cause);
-        }
-    }
-    DetectionOutcome::NoMatch
-}
-
-fn classify_raw_text(raw: &str) -> Option<StopCause> {
-    let upper = raw.to_ascii_uppercase();
-
-    // Check for retryable errors
-    if upper.contains("RESOURCE_EXHAUSTED") {
-        return Some(StopCause::ResourceExhausted);
-    }
-    if upper.contains("OVERLOADED") {
-        return Some(StopCause::Overloaded);
-    }
-    if upper.contains("UNAVAILABLE") {
-        return Some(StopCause::Unavailable);
-    }
-
-    // Check for HTTP status patterns
-    if upper.contains("HTTP 429") || raw.contains("\"status\":429") || raw.contains("\"status\": 429") {
-        return Some(StopCause::RateLimited);
-    }
-    if upper.contains("HTTP 503") || upper.contains("HTTP 529")
-        || raw.contains("\"status\":503") || raw.contains("\"status\":529") {
-        return Some(StopCause::Overloaded);
-    }
-
-    None
+#[derive(Debug, Deserialize)]
+struct AiCheckResponse {
+    should_continue: bool,
+    #[serde(default)]
+    reason: String,
 }
 
 // ============================================================================
 // Transcript Reading
 // ============================================================================
 
-/// Read the tail of the transcript file efficiently using Seek
 fn read_transcript_tail(path: &PathBuf) -> Result<Vec<TranscriptLine>, Box<dyn std::error::Error>> {
     let mut file = match File::open(path) {
         Ok(f) => f,
@@ -428,15 +130,10 @@ fn read_transcript_tail(path: &PathBuf) -> Result<Vec<TranscriptLine>, Box<dyn s
         return Ok(Vec::new());
     }
 
-    // Determine read position
     let (start_pos, drop_first_line) = if file_len <= TAIL_READ_BYTES {
-        // File is small enough to read entirely
         (0, false)
     } else {
-        // Seek to near the end
-        let start = file_len - TAIL_READ_BYTES;
-        // We'll drop the first line since it's likely partial
-        (start, true)
+        (file_len - TAIL_READ_BYTES, true)
     };
 
     file.seek(SeekFrom::Start(start_pos))?;
@@ -448,9 +145,8 @@ fn read_transcript_tail(path: &PathBuf) -> Result<Vec<TranscriptLine>, Box<dyn s
     loop {
         let mut line = String::new();
         match reader.read_line(&mut line) {
-            Ok(0) => break, // EOF
+            Ok(0) => break,
             Ok(_) => {
-                // Skip first line if we started mid-file (likely partial)
                 if first_line && drop_first_line {
                     first_line = false;
                     continue;
@@ -476,101 +172,288 @@ fn read_transcript_tail(path: &PathBuf) -> Result<Vec<TranscriptLine>, Box<dyn s
 }
 
 // ============================================================================
-// Core Logic
+// Transcript Formatting
 // ============================================================================
 
-/// Run all detectors and determine the action to take
-fn detect(lines: &[TranscriptLine], stop_hook_active: bool) -> DetectionOutcome {
-    for detector in DETECTORS {
-        let outcome = detector(lines, stop_hook_active);
-        if outcome != DetectionOutcome::NoMatch {
-            return outcome;
-        }
-    }
-    DetectionOutcome::NoMatch
-}
+fn format_transcript_for_ai(lines: &[TranscriptLine]) -> String {
+    let recent_lines: Vec<_> = lines.iter().rev().take(AI_MAX_LINES).collect();
+    let mut result = String::new();
 
-/// Decide what action to take based on detection outcome
-fn decide_action(
-    lines: &[TranscriptLine],
-    stop_hook_active: bool,
-    wait_seconds: u64,
-) -> Option<HookAction> {
-    match detect(lines, stop_hook_active) {
-        DetectionOutcome::Allow | DetectionOutcome::NoMatch => None,
-        DetectionOutcome::Block(cause) => {
-            // Non-retryable errors should not be blocked
-            if !cause.is_retryable() {
-                return None;
-            }
+    for line in recent_lines.into_iter().rev() {
+        if let Some(json) = &line.json {
+            let entry_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
 
-            Some(HookAction {
-                wait_seconds: cause.wait_seconds(wait_seconds),
-                output: HookOutput {
-                    decision: "block".to_string(),
-                    reason: cause.reason().to_string(),
-                },
-            })
-        }
-    }
-}
-
-// ============================================================================
-// CLI Argument Parsing
-// ============================================================================
-
-fn parse_args() -> u64 {
-    let args: Vec<String> = std::env::args().collect();
-    let mut wait_seconds = DEFAULT_WAIT_SECONDS;
-
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--wait" | "-w" => {
-                if i + 1 < args.len() {
-                    if let Ok(secs) = args[i + 1].parse::<u64>() {
-                        wait_seconds = secs;
+            match entry_type {
+                "user" => {
+                    if let Some(content) = json.pointer("/message/content").and_then(|v| v.as_str()) {
+                        result.push_str(&format!("User: {}\n", content));
                     }
-                    i += 1;
+                }
+                "assistant" => {
+                    if let Some(content) = json.pointer("/message/content") {
+                        let text = if let Some(s) = content.as_str() {
+                            s.to_string()
+                        } else if let Some(arr) = content.as_array() {
+                            arr.iter()
+                                .filter_map(|v| v.get("text").and_then(|t| t.as_str()))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        } else {
+                            continue;
+                        };
+                        if !text.is_empty() {
+                            result.push_str(&format!("Assistant: {}\n", text));
+                        }
+                    }
+                    if let Some(stop_reason) = json.pointer("/message/stop_reason").and_then(|v| v.as_str()) {
+                        result.push_str(&format!("[stop_reason: {}]\n", stop_reason));
+                    }
+                }
+                "error" => {
+                    let error_info = json.get("error").unwrap_or(json);
+                    result.push_str(&format!("[Error: {}]\n", error_info));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    result
+}
+
+// ============================================================================
+// Default System Prompt
+// ============================================================================
+
+fn default_system_prompt() -> &'static str {
+    r#"You are a supervisor monitoring a Claude Code session. Claude Code is an AI coding assistant that helps users with programming tasks through conversation.
+
+Your task: Analyze the conversation transcript and determine if Claude stopped working prematurely or completed the task properly.
+
+## Return "should_continue": true if:
+- Claude's response was cut off mid-sentence or mid-code (output truncation)
+- Claude encountered an API error, rate limit, or server issue
+- Claude said "I will do X" but didn't actually do it
+- Claude gave a partial answer and clearly has more work to do
+- Claude's last message ends abruptly without conclusion
+- There's an [Error: ...] in the transcript indicating a problem
+
+## Return "should_continue": false if:
+- Claude completed the requested task
+- Claude asked the user a question and is waiting for response
+- Claude explicitly said it's done or asked for feedback
+- The conversation reached a natural stopping point
+- Claude explained it cannot do something (legitimate refusal)
+- User's request was fully addressed
+
+## Output Format
+You must respond with ONLY a JSON object, no other text:
+{"should_continue": true, "reason": "brief explanation"}
+or
+{"should_continue": false, "reason": "brief explanation"}"#
+}
+
+// ============================================================================
+// JSON Extraction
+// ============================================================================
+
+/// Remove common thinking/reasoning tags from model output
+/// Handles: <think>...</think>, <thinking>...</thinking>, <reasoning>...</reasoning>, etc.
+fn remove_thinking_tags(text: &str) -> String {
+    let mut result = text.to_string();
+
+    // Common thinking tag patterns
+    let tag_patterns = [
+        ("think", "think"),
+        ("thinking", "thinking"),
+        ("reasoning", "reasoning"),
+        ("thought", "thought"),
+        ("reflection", "reflection"),
+    ];
+
+    for (open, close) in tag_patterns {
+        // Case-insensitive removal of <tag>...</tag>
+        let open_tag = format!("<{}>", open);
+        let close_tag = format!("</{}>", close);
+
+        loop {
+            let lower = result.to_lowercase();
+            if let Some(start) = lower.find(&open_tag.to_lowercase()) {
+                if let Some(end_offset) = lower[start..].find(&close_tag.to_lowercase()) {
+                    let end = start + end_offset + close_tag.len();
+                    result = format!("{}{}", &result[..start], &result[end..]);
+                    continue;
                 }
             }
-            "--help" | "-h" => {
-                println!("cc-goto-work - Claude Code Stop Hook");
-                println!();
-                println!("Detects transient API errors and instructs Claude to continue working.");
-                println!();
-                println!("USAGE:");
-                println!("    cc-goto-work [OPTIONS]");
-                println!();
-                println!("OPTIONS:");
-                println!(
-                    "    -w, --wait <SECONDS>    Wait time before continuing (default: {})",
-                    DEFAULT_WAIT_SECONDS
-                );
-                println!("    -h, --help              Print help information");
-                println!("    -V, --version           Print version information");
-                println!();
-                println!("DETECTED ERRORS:");
-                println!("    - RESOURCE_EXHAUSTED (API quota/overload)");
-                println!("    - Rate limits (HTTP 429)");
-                println!("    - Server overload (HTTP 503/529)");
-                println!("    - max_tokens (output truncation)");
-                println!();
-                println!("FATAL ERRORS (not retried):");
-                println!("    - Context length exceeded");
-                println!("    - Cost/spending limit reached");
-                process::exit(0);
+            break;
+        }
+    }
+
+    result.trim().to_string()
+}
+
+/// Extract JSON object from a string that may contain extra text
+/// Looks for the last valid JSON object in the string
+fn extract_json_from_response(text: &str) -> Option<&str> {
+    // Try to find JSON object patterns from the end
+    let mut depth = 0;
+    let mut end_pos = None;
+    let mut start_pos = None;
+
+    // Scan from end to find the last complete JSON object
+    for (i, c) in text.char_indices().rev() {
+        match c {
+            '}' => {
+                if depth == 0 {
+                    end_pos = Some(i + 1);
+                }
+                depth += 1;
             }
-            "--version" | "-V" => {
-                println!("cc-goto-work {}", env!("CARGO_PKG_VERSION"));
-                process::exit(0);
+            '{' => {
+                depth -= 1;
+                if depth == 0 && end_pos.is_some() {
+                    start_pos = Some(i);
+                    break;
+                }
             }
             _ => {}
         }
-        i += 1;
     }
 
-    wait_seconds
+    match (start_pos, end_pos) {
+        (Some(start), Some(end)) => Some(&text[start..end]),
+        _ => None,
+    }
+}
+
+/// Parse AI response, handling various output formats
+fn parse_ai_response(content: &str) -> Option<AiCheckResponse> {
+    // Step 1: Try direct parse (ideal case)
+    if let Ok(response) = serde_json::from_str::<AiCheckResponse>(content) {
+        return Some(response);
+    }
+
+    // Step 2: Remove thinking tags and try again
+    let cleaned = remove_thinking_tags(content);
+    if let Ok(response) = serde_json::from_str::<AiCheckResponse>(&cleaned) {
+        return Some(response);
+    }
+
+    // Step 3: Extract JSON from cleaned content
+    if let Some(json_str) = extract_json_from_response(&cleaned) {
+        if let Ok(response) = serde_json::from_str::<AiCheckResponse>(json_str) {
+            return Some(response);
+        }
+    }
+
+    // Step 4: Try extracting from original content (in case tag removal broke something)
+    if let Some(json_str) = extract_json_from_response(content) {
+        if let Ok(response) = serde_json::from_str::<AiCheckResponse>(json_str) {
+            return Some(response);
+        }
+    }
+
+    None
+}
+
+// ============================================================================
+// AI Check
+// ============================================================================
+
+async fn check_with_ai(lines: &[TranscriptLine], config: &Config) -> Option<(bool, String)> {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(config.timeout))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: failed to create HTTP client: {}", e);
+            return None;
+        }
+    };
+
+    let transcript_text = format_transcript_for_ai(lines);
+    if transcript_text.is_empty() {
+        return None;
+    }
+
+    let system_prompt = config.system_prompt
+        .as_deref()
+        .unwrap_or_else(|| default_system_prompt());
+
+    let request_body = serde_json::json!({
+        "model": config.model,
+        "messages": [
+            {
+                "role": "system",
+                "content": system_prompt
+            },
+            {
+                "role": "user",
+                "content": transcript_text
+            }
+        ],
+        "response_format": { "type": "json_object" },
+        "max_tokens": 256,
+        "temperature": 0
+    });
+
+    let url = format!("{}/chat/completions", config.api_base.trim_end_matches('/'));
+
+    let response = match client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", config.api_key))
+        .header("Content-Type", "application/json")
+        .json(&request_body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: API request failed: {}", e);
+            return None;
+        }
+    };
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        eprintln!("Error: API returned status {}: {}", status, body);
+        return None;
+    }
+
+    let body: serde_json::Value = match response.json().await {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Error: failed to parse API response: {}", e);
+            return None;
+        }
+    };
+
+    let content = body
+        .pointer("/choices/0/message/content")
+        .and_then(|v| v.as_str())?;
+
+    // Parse response, handling various output formats (thinking tags, extra text, etc.)
+    let decision = match parse_ai_response(content) {
+        Some(d) => d,
+        None => {
+            eprintln!("Error: failed to parse AI response: {}", content);
+            return None;
+        }
+    };
+
+    let reason = if decision.reason.is_empty() {
+        if decision.should_continue {
+            "AI determined task is incomplete".to_string()
+        } else {
+            "AI determined task is complete".to_string()
+        }
+    } else {
+        decision.reason
+    };
+
+    Some((decision.should_continue, reason))
 }
 
 // ============================================================================
@@ -590,16 +473,33 @@ fn expand_path(path: &str) -> PathBuf {
 // Main Entry Point
 // ============================================================================
 
-fn main() {
-    let wait_seconds = parse_args();
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    let args = Args::parse();
 
-    if let Err(e) = run(wait_seconds) {
-        eprintln!("Hook error: {}", e);
+    if let Err(e) = run(&args).await {
+        eprintln!("Error: {}", e);
         process::exit(1);
     }
 }
 
-fn run(wait_seconds: u64) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    // Load config
+    let config_path = expand_path(&args.config);
+    let config = match Config::load(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: failed to load config from {:?}: {}", config_path, e);
+            eprintln!("Please create a config file at {} with the following format:", DEFAULT_CONFIG_PATH);
+            eprintln!();
+            eprintln!("api_base: https://api.openai.com/v1");
+            eprintln!("api_key: your-api-key-here");
+            eprintln!("model: gpt-4o-mini");
+            eprintln!("timeout: 30  # optional");
+            return Err(e);
+        }
+    };
+
     // Read input from stdin
     let mut input_str = String::new();
     io::stdin().read_to_string(&mut input_str)?;
@@ -612,212 +512,30 @@ fn run(wait_seconds: u64) -> Result<(), Box<dyn std::error::Error>> {
         None => return Ok(()), // No transcript, allow stop
     };
 
-    let stop_hook_active = input.stop_hook_active.unwrap_or(false);
-
-    // Read transcript tail and detect issues
+    // Read transcript tail
     let lines = read_transcript_tail(&transcript_path)?;
-
-    if let Some(action) = decide_action(&lines, stop_hook_active, wait_seconds) {
-        // Wait before continuing (for rate limits, etc.)
-        if action.wait_seconds > 0 {
-            thread::sleep(Duration::from_secs(action.wait_seconds));
-        }
-
-        // Output the decision
-        println!("{}", serde_json::to_string(&action.output)?);
+    if lines.is_empty() {
+        return Ok(());
     }
 
-    // Exit 0 - if we printed JSON, it will be processed; otherwise stop is allowed
+    // Check with AI
+    match check_with_ai(&lines, &config).await {
+        Some((true, reason)) => {
+            // AI says continue
+            let output = HookOutput {
+                decision: "block".to_string(),
+                reason: format!("AI: {}", reason),
+            };
+            println!("{}", serde_json::to_string(&output)?);
+        }
+        Some((false, _)) => {
+            // AI says stop is fine - do nothing
+        }
+        None => {
+            // AI check failed - allow stop by default
+            eprintln!("Warning: AI check failed, allowing stop");
+        }
+    }
+
     Ok(())
-}
-
-// ============================================================================
-// Unit Tests
-// ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn line(raw: &str) -> TranscriptLine {
-        TranscriptLine {
-            raw: raw.to_string(),
-            json: serde_json::from_str::<serde_json::Value>(raw).ok(),
-        }
-    }
-
-    fn raw_line(raw: &str) -> TranscriptLine {
-        TranscriptLine {
-            raw: raw.to_string(),
-            json: None,
-        }
-    }
-
-    // ========== Fatal Error Tests ==========
-
-    #[test]
-    fn fatal_context_length_exceeded_allows_stop() {
-        let lines = vec![line(
-            r#"{"type":"error","error":{"type":"context_length_exceeded","message":"Context too long"}}"#,
-        )];
-        // Fatal errors return Block(cause) but is_retryable() returns false,
-        // so decide_action returns None (allowing the stop)
-        assert_eq!(
-            detect(&lines, false),
-            DetectionOutcome::Block(StopCause::ContextLengthExceeded)
-        );
-        assert!(decide_action(&lines, false, 30).is_none());
-    }
-
-    #[test]
-    fn fatal_cost_limit_allows_stop() {
-        let lines = vec![line(
-            r#"{"type":"error","error":{"type":"error","message":"Cost limit exceeded for this session"}}"#,
-        )];
-        assert_eq!(
-            detect(&lines, false),
-            DetectionOutcome::Block(StopCause::CostLimitReached)
-        );
-        assert!(decide_action(&lines, false, 30).is_none());
-    }
-
-    // ========== Stop Reason Boundary Tests ==========
-
-    #[test]
-    fn max_tokens_blocks_with_no_wait() {
-        let lines = vec![line(
-            r#"{"type":"assistant","message":{"stop_reason":"max_tokens"}}"#,
-        )];
-        assert_eq!(
-            detect(&lines, false),
-            DetectionOutcome::Block(StopCause::MaxTokens)
-        );
-        let action = decide_action(&lines, false, 30).expect("should block");
-        assert_eq!(action.wait_seconds, 0);
-    }
-
-    #[test]
-    fn end_turn_allows_even_with_old_error() {
-        let lines = vec![
-            line(r#"{"type":"error","error":{"type":"RESOURCE_EXHAUSTED"}}"#),
-            line(r#"{"type":"assistant","message":{"stop_reason":"end_turn"}}"#),
-        ];
-        assert_eq!(detect(&lines, false), DetectionOutcome::Allow);
-        assert!(decide_action(&lines, false, 30).is_none());
-    }
-
-    // ========== Structured Error Tests ==========
-
-    #[test]
-    fn resource_exhausted_blocks_with_wait() {
-        let lines = vec![line(
-            r#"{"type":"error","error":{"type":"RESOURCE_EXHAUSTED","message":"Rate limit"}}"#,
-        )];
-        assert_eq!(
-            detect(&lines, false),
-            DetectionOutcome::Block(StopCause::ResourceExhausted)
-        );
-        let action = decide_action(&lines, false, 30).expect("should block");
-        assert_eq!(action.wait_seconds, 30);
-    }
-
-    #[test]
-    fn rate_limit_error_blocks() {
-        let lines = vec![line(
-            r#"{"type":"error","error":{"type":"rate_limit_error","message":"Too many requests"}}"#,
-        )];
-        assert_eq!(
-            detect(&lines, false),
-            DetectionOutcome::Block(StopCause::RateLimited)
-        );
-    }
-
-    // ========== HTTP Status Tests ==========
-
-    #[test]
-    fn http_429_blocks() {
-        let lines = vec![line(
-            r#"{"type":"error","status":429,"message":"Rate limited"}"#,
-        )];
-        assert_eq!(
-            detect(&lines, false),
-            DetectionOutcome::Block(StopCause::RateLimited)
-        );
-    }
-
-    #[test]
-    fn http_503_blocks() {
-        let lines = vec![line(
-            r#"{"type":"error","error":{"status_code":503}}"#,
-        )];
-        assert_eq!(
-            detect(&lines, false),
-            DetectionOutcome::Block(StopCause::Overloaded)
-        );
-    }
-
-    // ========== Raw Fallback Tests ==========
-
-    #[test]
-    fn raw_fallback_detects_resource_exhausted() {
-        let lines = vec![raw_line("Error: RESOURCE_EXHAUSTED - please try again")];
-        assert_eq!(
-            detect(&lines, false),
-            DetectionOutcome::Block(StopCause::ResourceExhausted)
-        );
-    }
-
-    #[test]
-    fn raw_fallback_ignores_old_lines() {
-        let mut lines = vec![raw_line("RESOURCE_EXHAUSTED")];
-        // Add enough lines to push the error out of the fallback window
-        for _ in 0..RAW_FALLBACK_LINES {
-            lines.push(raw_line("normal line"));
-        }
-        // The error should be outside the window now
-        assert_eq!(detect_raw_fallback(&lines, false), DetectionOutcome::NoMatch);
-    }
-
-    #[test]
-    fn structured_error_ignores_old_lines() {
-        let mut lines = vec![line(
-            r#"{"type":"error","error":{"type":"RESOURCE_EXHAUSTED"}}"#,
-        )];
-        // Add enough normal lines to push the error out of the detection window
-        for _ in 0..RECENT_ERROR_LINES {
-            lines.push(line(r#"{"type":"user","message":{"content":"hello"}}"#));
-        }
-        // The error should be outside the window now
-        assert_eq!(detect_structured_error(&lines, false), DetectionOutcome::NoMatch);
-    }
-
-    #[test]
-    fn http_status_ignores_old_lines() {
-        let mut lines = vec![line(
-            r#"{"type":"error","status":429,"message":"Rate limited"}"#,
-        )];
-        // Add enough normal lines to push the error out of the detection window
-        for _ in 0..RECENT_ERROR_LINES {
-            lines.push(line(r#"{"type":"user","message":{"content":"hello"}}"#));
-        }
-        // The error should be outside the window now
-        assert_eq!(detect_http_status(&lines, false), DetectionOutcome::NoMatch);
-    }
-
-    // ========== Integration Tests ==========
-
-    #[test]
-    fn retryable_error_always_blocks_even_when_stop_hook_active() {
-        let lines = vec![line(
-            r#"{"type":"error","error":{"type":"RESOURCE_EXHAUSTED"}}"#,
-        )];
-        // stop_hook_active should NOT prevent blocking for retryable errors
-        assert!(decide_action(&lines, true, 30).is_some());
-    }
-
-    #[test]
-    fn no_match_returns_none() {
-        let lines = vec![line(r#"{"type":"user","message":{"content":"hello"}}"#)];
-        assert!(decide_action(&lines, false, 30).is_none());
-    }
 }

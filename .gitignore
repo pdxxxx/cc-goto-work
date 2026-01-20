@@ -16,3 +16,4 @@ Thumbs.db
 
 # Debug logs
 *.log
+.ace-tool/

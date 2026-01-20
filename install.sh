@@ -7,7 +7,8 @@
 set -e
 
 REPO="pdxxxx/cc-goto-work"
-INSTALL_DIR="$HOME/.local/bin"
+INSTALL_DIR="$HOME/.claude/cc-goto-work"
+CONFIG_FILE="$INSTALL_DIR/config.yaml"
 CLAUDE_SETTINGS_DIR="$HOME/.claude"
 CLAUDE_SETTINGS_FILE="$CLAUDE_SETTINGS_DIR/settings.json"
 
@@ -20,10 +21,10 @@ NC='\033[0m' # No Color
 
 print_banner() {
     echo -e "${BLUE}"
-    echo "╔═══════════════════════════════════════════════════════════╗"
-    echo "║           cc-goto-work Installer                          ║"
-    echo "║   Claude Code RESOURCE_EXHAUSTED Auto-Continue Hook       ║"
-    echo "╚═══════════════════════════════════════════════════════════╝"
+    echo "============================================================"
+    echo "           cc-goto-work Installer                           "
+    echo "   Claude Code AI-based Session Detector Hook               "
+    echo "============================================================"
     echo -e "${NC}"
 }
 
@@ -110,16 +111,48 @@ download_binary() {
     chmod +x "$dest"
 }
 
+create_config() {
+    local api_base="$1"
+    local api_key="$2"
+    local model="$3"
+
+    print_step "Creating config file..."
+
+    cat > "$CONFIG_FILE" << EOF
+# cc-goto-work configuration
+# https://github.com/pdxxxx/cc-goto-work
+
+# OpenAI compatible API base URL
+api_base: $api_base
+
+# API key for authentication
+api_key: $api_key
+
+# Model name to use
+model: $model
+
+# Request timeout in seconds (optional)
+timeout: 30
+
+# Custom system prompt (optional)
+# Uncomment and modify to customize AI behavior
+# system_prompt: |
+#   You are a supervisor for an AI coding agent...
+EOF
+
+    chmod 600 "$CONFIG_FILE"
+    print_step "Config file created at $CONFIG_FILE"
+}
+
 configure_settings() {
     local binary_path="$1"
-    local wait_time="$2"
 
     print_step "Configuring Claude Code settings..."
 
     # Create settings directory if not exists
     mkdir -p "$CLAUDE_SETTINGS_DIR"
 
-    local hook_command="$binary_path --wait $wait_time"
+    local hook_command="$binary_path"
 
     if [ -f "$CLAUDE_SETTINGS_FILE" ]; then
         # Check if file has content
@@ -139,8 +172,7 @@ configure_settings() {
                 return
             fi
 
-            # Try to add hooks to existing settings using simple approach
-            # This is a simplified approach - for complex JSON manipulation, use jq if available
+            # Try to add hooks to existing settings
             if command -v jq &> /dev/null; then
                 local new_settings=$(jq --arg cmd "$hook_command" '.hooks.Stop = [{"hooks": [{"type": "command", "command": $cmd, "timeout": 120}]}]' "$CLAUDE_SETTINGS_FILE")
                 echo "$new_settings" > "$CLAUDE_SETTINGS_FILE"
@@ -233,14 +265,8 @@ main() {
 
     echo ""
 
-    # Ask for installation directory
-    INSTALL_DIR=$(prompt_input "Installation directory" "$INSTALL_DIR")
+    # Create installation directory
     mkdir -p "$INSTALL_DIR"
-
-    # Ask for wait time
-    local wait_time=$(prompt_input "Wait time in seconds before retry" "30")
-
-    echo ""
 
     # Download binary
     local binary_path="$INSTALL_DIR/cc-goto-work"
@@ -248,9 +274,31 @@ main() {
 
     echo ""
 
-    # Configure settings
+    # Configure API settings
+    print_step "Configuring AI settings..."
+    echo ""
+    echo "This hook uses an AI model to detect incomplete sessions."
+    echo "You need to provide an OpenAI-compatible API endpoint."
+    echo ""
+
+    local api_base=$(prompt_input "API base URL" "https://api.openai.com/v1")
+    local api_key=$(prompt_input "API key" "")
+    local model=$(prompt_input "Model name" "gpt-4o-mini")
+
+    if [ -z "$api_key" ]; then
+        print_warning "No API key provided. You'll need to edit $CONFIG_FILE before using."
+    fi
+
+    echo ""
+
+    # Create config file
+    create_config "$api_base" "$api_key" "$model"
+
+    echo ""
+
+    # Configure Claude settings
     if prompt_yes_no "Configure Claude Code settings automatically?" "y"; then
-        configure_settings "$binary_path" "$wait_time"
+        configure_settings "$binary_path"
     else
         echo ""
         echo "To configure manually, add this to $CLAUDE_SETTINGS_FILE:"
@@ -263,7 +311,7 @@ main() {
         "hooks": [
           {
             "type": "command",
-            "command": "$binary_path --wait $wait_time",
+            "command": "$binary_path",
             "timeout": 120
           }
         ]
@@ -275,20 +323,10 @@ EOF
     fi
 
     echo ""
-
-    # Check if install dir is in PATH
-    if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
-        print_warning "$INSTALL_DIR is not in your PATH"
-        echo ""
-        echo "Add the following to your shell profile (~/.bashrc, ~/.zshrc, etc.):"
-        echo ""
-        echo -e "    ${YELLOW}export PATH=\"\$PATH:$INSTALL_DIR\"${NC}"
-        echo ""
-    fi
-
     echo -e "${GREEN}Installation complete!${NC}"
     echo ""
     echo "Binary installed to: $binary_path"
+    echo "Config file: $CONFIG_FILE"
     echo "Settings file: $CLAUDE_SETTINGS_FILE"
     echo ""
     echo "Restart Claude Code for the hook to take effect."
