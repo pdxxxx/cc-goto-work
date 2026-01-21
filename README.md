@@ -6,19 +6,27 @@
 
 ## 安装
 
-### 快速安装（推荐）
+### 使用 npx（推荐）
 
-**Linux / macOS:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/pdxxxx/cc-goto-work/main/install.sh | bash
+npx cc-goto-work
 ```
 
-**Windows (PowerShell):**
-```powershell
-irm https://raw.githubusercontent.com/pdxxxx/cc-goto-work/main/install.ps1 | iex
-```
+运行后会显示交互式菜单：
 
-安装脚本会自动完成所有配置。
+```
+╔════════════════════════════════════════════════════════════╗
+║              cc-goto-work 安装程序                         ║
+╚════════════════════════════════════════════════════════════╝
+
+请选择操作：
+
+  1 - 完整安装 (下载 + 配置 API + 配置 Hook)
+  2 - 仅下载二进制文件
+  3 - 仅配置 API 设置
+  4 - 仅配置 Claude Code Hook
+  0 - 退出
+```
 
 ### 手动安装
 

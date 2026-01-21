@@ -1,0 +1,30 @@
+{
+  "name": "cc-goto-work",
+  "version": "0.8.0",
+  "description": "让 Claude Code 自动继续未完成的工作",
+  "bin": {
+    "cc-goto-work": "./bin/cli.js"
+  },
+  "scripts": {
+    "test": "node bin/cli.js"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "hook",
+    "ai",
+    "automation"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pdxxxx/cc-goto-work.git"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "files": [
+    "bin/"
+  ]
+}
