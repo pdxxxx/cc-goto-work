@@ -139,6 +139,9 @@ model: $Model
 # Request timeout in seconds (optional)
 timeout: 30
 
+# Enable debug logging (optional). Writes cc-goto-work.log next to the executable.
+debug: false
+
 # Custom system prompt (optional)
 # Uncomment and modify to customize AI behavior
 # system_prompt: |

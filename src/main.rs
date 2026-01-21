@@ -9,11 +9,11 @@
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::process;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ============================================================================
 // Constants
@@ -27,6 +27,8 @@ const TAIL_READ_BYTES: u64 = 10 * 1024;
 const AI_MAX_LINES: usize = 20;
 /// Default API request timeout in seconds
 const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
+/// Debug log file name (written next to the executable when enabled)
+const DEBUG_LOG_FILENAME: &str = "cc-goto-work.log";
 
 // ============================================================================
 // CLI Arguments
@@ -60,6 +62,9 @@ struct Config {
     /// Custom system prompt (optional)
     #[serde(default)]
     system_prompt: Option<String>,
+    /// Enable debug logging to a file alongside the executable (optional, default: false)
+    #[serde(default)]
+    debug: bool,
 }
 
 fn default_timeout() -> u64 {
@@ -72,6 +77,125 @@ impl Config {
         let config: Config = serde_yaml::from_str(&content)?;
         Ok(config)
     }
+}
+
+// ============================================================================
+// Debug Logging
+// ============================================================================
+
+/// Debug logger that writes to a file alongside the executable
+struct DebugLogger {
+    enabled: bool,
+    log_path: PathBuf,
+    run_id: String,
+}
+
+impl DebugLogger {
+    /// Create a new debug logger. If enabled, attempts to create/open the log file.
+    fn new(enabled: bool) -> Self {
+        let log_path = Self::default_log_path().unwrap_or_else(Self::fallback_log_path);
+        let run_id = Self::generate_run_id();
+
+        let mut logger = Self {
+            enabled,
+            log_path,
+            run_id,
+        };
+
+        if logger.enabled {
+            if let Err(e) = logger.touch() {
+                eprintln!(
+                    "Warning: debug enabled but failed to create log file at {:?}: {}",
+                    logger.log_path, e
+                );
+                logger.enabled = false;
+            }
+        }
+
+        logger
+    }
+
+    /// Log path accessor for display purposes
+    fn path(&self) -> &PathBuf {
+        &self.log_path
+    }
+
+    /// Attempt to create/touch the log file
+    fn touch(&self) -> io::Result<()> {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log_path)?;
+
+        // Set file permissions to 0600 on Unix for security (owner read/write only)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+
+        Ok(())
+    }
+
+    /// Write a log entry. Silently ignores errors to avoid affecting main flow.
+    fn log(&self, level: &str, message: impl AsRef<str>) {
+        if !self.enabled {
+            return;
+        }
+
+        let ts = Self::now_timestamp();
+        let msg = message.as_ref();
+        let line = format!("{} [{}] [{}] {}\n", ts, self.run_id, level, msg);
+
+        if let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log_path)
+        {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+
+    /// Generate a unique run ID combining PID and timestamp
+    fn generate_run_id() -> String {
+        let pid = process::id();
+        let ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        format!("pid{}-{}", pid, ms)
+    }
+
+    /// Get current timestamp as epoch seconds with milliseconds
+    fn now_timestamp() -> String {
+        match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(d) => format!("{}.{:03}", d.as_secs(), d.subsec_millis()),
+            Err(_) => "0.000".to_string(),
+        }
+    }
+
+    /// Get log path next to the executable
+    fn default_log_path() -> Option<PathBuf> {
+        let exe = std::env::current_exe().ok()?;
+        let dir = exe.parent()?;
+        Some(dir.join(DEBUG_LOG_FILENAME))
+    }
+
+    /// Fallback to current working directory if executable path fails
+    fn fallback_log_path() -> PathBuf {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(DEBUG_LOG_FILENAME)
+    }
+}
+
+/// Truncate a string to a single line with max characters, replacing newlines
+fn truncate_for_log(s: &str, max_chars: usize) -> String {
+    let mut out: String = s.chars().take(max_chars).collect();
+    if s.chars().count() > max_chars {
+        out.push_str("...");
+    }
+    out.replace('\n', "\\n").replace('\r', "\\r")
 }
 
 // ============================================================================
@@ -360,7 +484,15 @@ fn parse_ai_response(content: &str) -> Option<AiCheckResponse> {
 // AI Check
 // ============================================================================
 
-async fn check_with_ai(lines: &[TranscriptLine], config: &Config) -> Option<(bool, String)> {
+async fn check_with_ai(lines: &[TranscriptLine], config: &Config, logger: &DebugLogger) -> Option<(bool, String)> {
+    logger.log(
+        "INFO",
+        format!(
+            "ai check start: api_base={}, model={}, timeout={}s, lines={}",
+            config.api_base, config.model, config.timeout, lines.len()
+        ),
+    );
+
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(config.timeout))
         .build()
@@ -368,18 +500,30 @@ async fn check_with_ai(lines: &[TranscriptLine], config: &Config) -> Option<(boo
         Ok(c) => c,
         Err(e) => {
             eprintln!("Error: failed to create HTTP client: {}", e);
+            logger.log("ERROR", format!("failed to create HTTP client: {}", e));
             return None;
         }
     };
 
     let transcript_text = format_transcript_for_ai(lines);
     if transcript_text.is_empty() {
+        logger.log("WARN", "empty transcript after formatting; skipping ai check");
         return None;
     }
 
     let system_prompt = config.system_prompt
         .as_deref()
         .unwrap_or_else(|| default_system_prompt());
+
+    logger.log(
+        "DEBUG",
+        format!(
+            "prompt: custom={}, system_chars={}, transcript_chars={}",
+            config.system_prompt.is_some(),
+            system_prompt.len(),
+            transcript_text.len()
+        ),
+    );
 
     let request_body = serde_json::json!({
         "model": config.model,
@@ -400,6 +544,11 @@ async fn check_with_ai(lines: &[TranscriptLine], config: &Config) -> Option<(boo
 
     let url = format!("{}/chat/completions", config.api_base.trim_end_matches('/'));
 
+    logger.log(
+        "INFO",
+        format!("api request: POST {} (transcript_chars={})", url, transcript_text.len()),
+    );
+
     let response = match client
         .post(&url)
         .header("Authorization", format!("Bearer {}", config.api_key))
@@ -411,14 +560,21 @@ async fn check_with_ai(lines: &[TranscriptLine], config: &Config) -> Option<(boo
         Ok(r) => r,
         Err(e) => {
             eprintln!("Error: API request failed: {}", e);
+            logger.log("ERROR", format!("api request failed: {}", e));
             return None;
         }
     };
+
+    logger.log("INFO", format!("api response status: {}", response.status()));
 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         eprintln!("Error: API returned status {}: {}", status, body);
+        logger.log(
+            "ERROR",
+            format!("api returned status {} body={}", status, truncate_for_log(&body, 500)),
+        );
         return None;
     }
 
@@ -426,6 +582,7 @@ async fn check_with_ai(lines: &[TranscriptLine], config: &Config) -> Option<(boo
         Ok(b) => b,
         Err(e) => {
             eprintln!("Error: failed to parse API response: {}", e);
+            logger.log("ERROR", format!("failed to parse API response json: {}", e));
             return None;
         }
     };
@@ -434,11 +591,17 @@ async fn check_with_ai(lines: &[TranscriptLine], config: &Config) -> Option<(boo
         .pointer("/choices/0/message/content")
         .and_then(|v| v.as_str())?;
 
+    logger.log("DEBUG", format!("model content={}", truncate_for_log(content, 500)));
+
     // Parse response, handling various output formats (thinking tags, extra text, etc.)
     let decision = match parse_ai_response(content) {
         Some(d) => d,
         None => {
             eprintln!("Error: failed to parse AI response: {}", content);
+            logger.log(
+                "ERROR",
+                format!("failed to parse AI response content={}", truncate_for_log(content, 500)),
+            );
             return None;
         }
     };
@@ -452,6 +615,15 @@ async fn check_with_ai(lines: &[TranscriptLine], config: &Config) -> Option<(boo
     } else {
         decision.reason
     };
+
+    logger.log(
+        "INFO",
+        format!(
+            "ai decision: should_continue={} reason={}",
+            decision.should_continue,
+            truncate_for_log(&reason, 300)
+        ),
+    );
 
     Some((decision.should_continue, reason))
 }
@@ -496,44 +668,100 @@ async fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("api_key: your-api-key-here");
             eprintln!("model: gpt-4o-mini");
             eprintln!("timeout: 30  # optional");
+            eprintln!("debug: false  # optional");
             return Err(e);
         }
     };
 
+    // Initialize debug logger
+    let logger = DebugLogger::new(config.debug);
+    logger.log(
+        "INFO",
+        format!(
+            "cc-goto-work {} start (log={:?})",
+            env!("CARGO_PKG_VERSION"),
+            logger.path()
+        ),
+    );
+    logger.log("INFO", format!("config loaded from {:?}", config_path));
+    logger.log(
+        "DEBUG",
+        format!(
+            "config: api_base={}, model={}, timeout={}s, system_prompt_custom={}",
+            config.api_base, config.model, config.timeout, config.system_prompt.is_some()
+        ),
+    );
+
     // Read input from stdin
     let mut input_str = String::new();
     io::stdin().read_to_string(&mut input_str)?;
+    logger.log("DEBUG", format!("stdin bytes: {}", input_str.len()));
 
-    let input: HookInput = serde_json::from_str(&input_str)?;
+    let input: HookInput = match serde_json::from_str(&input_str) {
+        Ok(v) => v,
+        Err(e) => {
+            logger.log("ERROR", format!("failed to parse stdin JSON: {}", e));
+            return Err(e.into());
+        }
+    };
+    logger.log(
+        "DEBUG",
+        format!(
+            "hook input: session_id={:?} transcript_path={:?} cwd={:?} hook_event_name={:?} stop_hook_active={:?}",
+            input.session_id, input.transcript_path, input.cwd, input.hook_event_name, input.stop_hook_active
+        ),
+    );
 
     // Get transcript path
     let transcript_path = match &input.transcript_path {
         Some(path) => expand_path(path),
-        None => return Ok(()), // No transcript, allow stop
+        None => {
+            logger.log("INFO", "no transcript_path in stdin; allowing stop");
+            return Ok(());
+        }
     };
+    logger.log(
+        "INFO",
+        format!(
+            "transcript_path={:?} exists={}",
+            transcript_path,
+            transcript_path.exists()
+        ),
+    );
 
     // Read transcript tail
     let lines = read_transcript_tail(&transcript_path)?;
+    logger.log("INFO", format!("transcript lines read: {}", lines.len()));
     if lines.is_empty() {
+        logger.log("INFO", "no transcript lines; allowing stop");
         return Ok(());
     }
 
     // Check with AI
-    match check_with_ai(&lines, &config).await {
+    match check_with_ai(&lines, &config, &logger).await {
         Some((true, reason)) => {
             // AI says continue
+            logger.log(
+                "INFO",
+                format!("hook output: decision=block reason={}", truncate_for_log(&reason, 300)),
+            );
             let output = HookOutput {
                 decision: "block".to_string(),
                 reason: format!("AI: {}", reason),
             };
             println!("{}", serde_json::to_string(&output)?);
         }
-        Some((false, _)) => {
+        Some((false, reason)) => {
             // AI says stop is fine - do nothing
+            logger.log(
+                "INFO",
+                format!("ai decision: allow stop, reason={}", truncate_for_log(&reason, 300)),
+            );
         }
         None => {
             // AI check failed - allow stop by default
             eprintln!("Warning: AI check failed, allowing stop");
+            logger.log("WARN", "ai check failed; allowing stop by default");
         }
     }
 

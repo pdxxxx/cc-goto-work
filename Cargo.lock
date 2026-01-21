@@ -94,7 +94,7 @@ dependencies = [
 
 [[package]]
 name = "cc-goto-work"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "clap",
  "dirs-next",
