@@ -69,6 +69,7 @@ function printMenu() {
   print(`  ${colors.cyan}2${colors.reset} - 仅下载二进制文件`);
   print(`  ${colors.cyan}3${colors.reset} - 仅配置 API 设置`);
   print(`  ${colors.cyan}4${colors.reset} - 仅配置 Claude Code Hook`);
+  print(`  ${colors.cyan}5${colors.reset} - ${colors.red}卸载 cc-goto-work${colors.reset}`);
   print(`  ${colors.cyan}0${colors.reset} - 退出`);
   print('');
 }
@@ -417,6 +418,113 @@ async function configureHookOnly(rl) {
 }
 
 // ============================================================================
+// Uninstall
+// ============================================================================
+
+function removeStopHook() {
+  if (!fs.existsSync(CLAUDE_SETTINGS_FILE)) {
+    printWarning('Claude Code 配置文件不存在');
+    return false;
+  }
+
+  try {
+    const content = fs.readFileSync(CLAUDE_SETTINGS_FILE, 'utf8');
+    if (!content.trim()) {
+      printWarning('Claude Code 配置文件为空');
+      return false;
+    }
+
+    const settings = JSON.parse(content);
+
+    if (!settings.hooks || !settings.hooks.Stop) {
+      printWarning('Stop hook 不存在，无需移除');
+      return false;
+    }
+
+    // Backup before modifying
+    fs.writeFileSync(`${CLAUDE_SETTINGS_FILE}.backup`, content);
+    printWarning(`已备份现有配置到: ${CLAUDE_SETTINGS_FILE}.backup`);
+
+    // Remove Stop hook
+    delete settings.hooks.Stop;
+
+    // Remove hooks object if empty
+    if (Object.keys(settings.hooks).length === 0) {
+      delete settings.hooks;
+    }
+
+    fs.writeFileSync(CLAUDE_SETTINGS_FILE, JSON.stringify(settings, null, 2));
+    printSuccess('已从 Claude Code 配置中移除 Stop hook');
+    return true;
+  } catch (e) {
+    printError(`移除 Stop hook 失败: ${e.message}`);
+    return false;
+  }
+}
+
+function removeDirectory(dirPath) {
+  if (!fs.existsSync(dirPath)) {
+    return false;
+  }
+
+  try {
+    fs.rmSync(dirPath, { recursive: true, force: true });
+    return true;
+  } catch (e) {
+    printError(`删除目录失败: ${e.message}`);
+    return false;
+  }
+}
+
+async function uninstall(rl) {
+  printStep('卸载 cc-goto-work...');
+  print('');
+
+  // Check what exists
+  const platformStr = detectPlatform();
+  const binaryName = getBinaryName(platformStr || 'linux-amd64');
+  const binaryPath = path.join(INSTALL_DIR, binaryName);
+
+  const binaryExists = fs.existsSync(binaryPath);
+  const configExists = fs.existsSync(CONFIG_FILE);
+  const dirExists = fs.existsSync(INSTALL_DIR);
+
+  if (!binaryExists && !configExists && !dirExists) {
+    printWarning('未检测到安装，无需卸载');
+    return false;
+  }
+
+  print('检测到以下已安装内容:');
+  if (binaryExists) print(`  - 二进制文件: ${binaryPath}`);
+  if (configExists) print(`  - 配置文件: ${CONFIG_FILE}`);
+  if (dirExists) print(`  - 安装目录: ${INSTALL_DIR}`);
+  print('');
+
+  if (!(await promptConfirm(rl, `${colors.red}确认卸载 cc-goto-work?${colors.reset}`, false))) {
+    print('卸载已取消');
+    return false;
+  }
+
+  print('');
+
+  // Remove Stop hook from Claude settings
+  printStep('移除 Claude Code Hook...');
+  removeStopHook();
+
+  // Remove installation directory
+  printStep('删除安装目录...');
+  if (dirExists) {
+    if (removeDirectory(INSTALL_DIR)) {
+      printSuccess(`已删除: ${INSTALL_DIR}`);
+    }
+  } else {
+    printWarning('安装目录不存在');
+  }
+
+  return true;
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -429,7 +537,7 @@ async function main() {
     while (true) {
       printMenu();
 
-      const choice = await question(rl, '请输入选项 (0-4): ');
+      const choice = await question(rl, '请输入选项 (0-5): ');
 
       let success = false;
 
@@ -446,6 +554,9 @@ async function main() {
         case '4':
           success = await configureHookOnly(rl);
           break;
+        case '5':
+          success = await uninstall(rl);
+          break;
         case '0':
         case 'q':
         case 'exit':
@@ -454,7 +565,7 @@ async function main() {
           rl.close();
           return;
         default:
-          printError('无效选项，请输入 0-4');
+          printError('无效选项，请输入 0-5');
           continue;
       }
 
