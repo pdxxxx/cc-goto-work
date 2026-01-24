@@ -69,7 +69,8 @@ function printMenu() {
   print(`  ${colors.cyan}2${colors.reset} - 仅下载二进制文件`);
   print(`  ${colors.cyan}3${colors.reset} - 仅配置 API 设置`);
   print(`  ${colors.cyan}4${colors.reset} - 仅配置 Claude Code Hook`);
-  print(`  ${colors.cyan}5${colors.reset} - ${colors.red}卸载 cc-goto-work${colors.reset}`);
+  print(`  ${colors.cyan}5${colors.reset} - ${colors.blue}检查更新${colors.reset}`);
+  print(`  ${colors.cyan}6${colors.reset} - ${colors.red}卸载 cc-goto-work${colors.reset}`);
   print(`  ${colors.cyan}0${colors.reset} - 退出`);
   print('');
 }
@@ -196,6 +197,10 @@ async function downloadBinary(version, platformStr) {
   if (!platformStr.startsWith('windows')) {
     fs.chmodSync(destPath, 0o755);
   }
+
+  // Save version info
+  const versionFile = path.join(INSTALL_DIR, '.version');
+  fs.writeFileSync(versionFile, version);
 
   printSuccess(`二进制文件已下载到: ${destPath}`);
   return destPath;
@@ -418,6 +423,115 @@ async function configureHookOnly(rl) {
 }
 
 // ============================================================================
+// Update
+// ============================================================================
+
+const VERSION_FILE = path.join(INSTALL_DIR, '.version');
+
+function getInstalledVersion() {
+  try {
+    if (fs.existsSync(VERSION_FILE)) {
+      return fs.readFileSync(VERSION_FILE, 'utf8').trim();
+    }
+  } catch (e) {
+    // Ignore
+  }
+  return null;
+}
+
+function saveInstalledVersion(version) {
+  try {
+    fs.mkdirSync(INSTALL_DIR, { recursive: true });
+    fs.writeFileSync(VERSION_FILE, version);
+  } catch (e) {
+    // Ignore
+  }
+}
+
+function compareVersions(v1, v2) {
+  // Remove 'v' prefix if present
+  const normalize = (v) => v.replace(/^v/, '').split('.').map(Number);
+  const parts1 = normalize(v1);
+  const parts2 = normalize(v2);
+
+  for (let i = 0; i < Math.max(parts1.length, parts2.length); i++) {
+    const p1 = parts1[i] || 0;
+    const p2 = parts2[i] || 0;
+    if (p1 > p2) return 1;
+    if (p1 < p2) return -1;
+  }
+  return 0;
+}
+
+async function checkUpdate(rl) {
+  printStep('检查更新...');
+  print('');
+
+  const platformStr = detectPlatform();
+  if (!platformStr) {
+    printError(`不支持的平台: ${os.platform()} ${os.arch()}`);
+    return false;
+  }
+
+  const binaryName = getBinaryName(platformStr);
+  const binaryPath = path.join(INSTALL_DIR, binaryName);
+
+  if (!fs.existsSync(binaryPath)) {
+    printWarning('未检测到安装，请先安装');
+    return false;
+  }
+
+  // Get installed version
+  const installedVersion = getInstalledVersion();
+  if (installedVersion) {
+    print(`  当前版本: ${installedVersion}`);
+  } else {
+    print(`  当前版本: ${colors.yellow}未知${colors.reset}`);
+  }
+
+  // Get latest version
+  printStep('获取最新版本...');
+  let latestVersion;
+  try {
+    latestVersion = await getLatestVersion();
+    print(`  最新版本: ${latestVersion}`);
+  } catch (e) {
+    printError(`获取版本失败: ${e.message}`);
+    return false;
+  }
+
+  print('');
+
+  // Compare versions
+  if (installedVersion && compareVersions(installedVersion, latestVersion) >= 0) {
+    printSuccess('已是最新版本，无需更新');
+    return true;
+  }
+
+  // Ask to update
+  const updateMsg = installedVersion
+    ? `发现新版本！是否从 ${installedVersion} 更新到 ${latestVersion}?`
+    : `是否更新到 ${latestVersion}?`;
+
+  if (!(await promptConfirm(rl, updateMsg))) {
+    print('更新已取消');
+    return false;
+  }
+
+  // Download new version
+  print('');
+  try {
+    await downloadBinary(latestVersion, platformStr);
+    saveInstalledVersion(latestVersion);
+    printSuccess(`已更新到 ${latestVersion}`);
+    return true;
+  } catch (e) {
+    printError(`更新失败: ${e.message}`);
+    return false;
+  }
+}
+
+// ============================================================================
 // Uninstall
 // ============================================================================
 
@@ -537,7 +651,7 @@ async function main() {
     while (true) {
       printMenu();
 
-      const choice = await question(rl, '请输入选项 (0-5): ');
+      const choice = await question(rl, '请输入选项 (0-6): ');
 
       let success = false;
 
@@ -555,6 +669,9 @@ async function main() {
           success = await configureHookOnly(rl);
           break;
         case '5':
+          success = await checkUpdate(rl);
+          break;
+        case '6':
           success = await uninstall(rl);
           break;
         case '0':
@@ -565,7 +682,7 @@ async function main() {
           rl.close();
           return;
         default:
-          printError('无效选项，请输入 0-5');
+          printError('无效选项，请输入 0-6');
           continue;
       }
 
