@@ -127,14 +127,11 @@ function New-ConfigFile {
 # cc-goto-work configuration
 # https://github.com/pdxxxx/cc-goto-work
 
-# OpenAI compatible API base URL
-api_base: $ApiBase
-
-# API key for authentication
-api_key: $ApiKey
-
-# Model name to use
-model: $Model
+providers:
+  - api_base: $ApiBase
+    api_key: $ApiKey
+    models:
+      - $Model
 
 # Request timeout in seconds (optional)
 timeout: 30

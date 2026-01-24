@@ -13,6 +13,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::process;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ============================================================================
@@ -50,12 +51,9 @@ struct Args {
 
 #[derive(Debug, Deserialize)]
 struct Config {
-    /// OpenAI compatible API base URL
-    api_base: String,
-    /// API key for authentication
-    api_key: String,
-    /// Model name to use
-    model: String,
+    /// Multiple providers with multiple models each
+    providers: Vec<ProviderConfig>,
+
     /// Request timeout in seconds (optional, default: 30)
     #[serde(default = "default_timeout")]
     timeout: u64,
@@ -67,6 +65,17 @@ struct Config {
     debug: bool,
 }
 
+/// Configuration for a single API provider
+#[derive(Debug, Deserialize, Clone)]
+struct ProviderConfig {
+    /// OpenAI compatible API base URL
+    api_base: String,
+    /// API key for authentication
+    api_key: String,
+    /// List of model names to use from this provider
+    models: Vec<String>,
+}
+
 fn default_timeout() -> u64 {
     DEFAULT_TIMEOUT_SECONDS
 }
@@ -75,6 +84,20 @@ impl Config {
     fn load(path: &PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
         let content = fs::read_to_string(path)?;
         let config: Config = serde_yaml::from_str(&content)?;
+        if config.providers.is_empty() {
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "no providers configured: `providers` list is empty",
+            )));
+        }
+        // Validate at least one model is configured
+        let total_models: usize = config.providers.iter().map(|p| p.models.len()).sum();
+        if total_models == 0 {
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "no models configured: each provider must have at least one model",
+            )));
+        }
         Ok(config)
     }
 }
@@ -484,26 +507,175 @@ fn parse_ai_response(content: &str) -> Option<AiCheckResponse> {
 // AI Check
 // ============================================================================
 
-async fn check_with_ai(lines: &[TranscriptLine], config: &Config, logger: &DebugLogger) -> Option<(bool, String)> {
+/// Result from a single model check
+struct ModelCheckResult {
+    api_base: String,
+    model: String,
+    should_continue: bool,
+    reason: String,
+}
+
+/// Check a single model and return its decision
+async fn check_single_model(
+    transcript_text: &str,
+    api_base: &str,
+    api_key: &str,
+    model: &str,
+    timeout: u64,
+    system_prompt: &str,
+    logger: &DebugLogger,
+) -> Option<ModelCheckResult> {
     logger.log(
         "INFO",
         format!(
-            "ai check start: api_base={}, model={}, timeout={}s, lines={}",
-            config.api_base, config.model, config.timeout, lines.len()
+            "single model check: api_base={}, model={}, timeout={}s",
+            api_base, model, timeout
         ),
     );
 
     let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(config.timeout))
+        .timeout(Duration::from_secs(timeout))
         .build()
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Error: failed to create HTTP client: {}", e);
-            logger.log("ERROR", format!("failed to create HTTP client: {}", e));
+            logger.log("ERROR", format!("[{}] failed to create HTTP client: {}", model, e));
             return None;
         }
     };
+
+    let request_body = serde_json::json!({
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": system_prompt
+            },
+            {
+                "role": "user",
+                "content": transcript_text
+            }
+        ],
+        "response_format": { "type": "json_object" },
+        "max_tokens": 256,
+        "temperature": 0
+    });
+
+    let url = format!("{}/chat/completions", api_base.trim_end_matches('/'));
+
+    logger.log(
+        "DEBUG",
+        format!("[{}] api request: POST {}", model, url),
+    );
+
+    let response = match client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&request_body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            logger.log("ERROR", format!("[{}] api request failed: {}", model, e));
+            return None;
+        }
+    };
+
+    logger.log("DEBUG", format!("[{}] api response status: {}", model, response.status()));
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        logger.log(
+            "ERROR",
+            format!("[{}] api returned status {} body={}", model, status, truncate_for_log(&body, 500)),
+        );
+        return None;
+    }
+
+    let body: serde_json::Value = match response.json().await {
+        Ok(b) => b,
+        Err(e) => {
+            logger.log("ERROR", format!("[{}] failed to parse API response json: {}", model, e));
+            return None;
+        }
+    };
+
+    let content = match body.pointer("/choices/0/message/content").and_then(|v| v.as_str()) {
+        Some(c) => c,
+        None => {
+            logger.log(
+                "ERROR",
+                format!("[{}] missing or invalid content in response: {}", model, truncate_for_log(&body.to_string(), 500)),
+            );
+            return None;
+        }
+    };
+
+    logger.log("DEBUG", format!("[{}] model content={}", model, truncate_for_log(content, 500)));
+
+    // Parse response, handling various output formats (thinking tags, extra text, etc.)
+    let decision = match parse_ai_response(content) {
+        Some(d) => d,
+        None => {
+            logger.log(
+                "ERROR",
+                format!("[{}] failed to parse AI response content={}", model, truncate_for_log(content, 500)),
+            );
+            return None;
+        }
+    };
+
+    let reason = if decision.reason.is_empty() {
+        if decision.should_continue {
+            "AI determined task is incomplete".to_string()
+        } else {
+            "AI determined task is complete".to_string()
+        }
+    } else {
+        decision.reason
+    };
+
+    logger.log(
+        "INFO",
+        format!(
+            "[{}] decision: should_continue={} reason={}",
+            model,
+            decision.should_continue,
+            truncate_for_log(&reason, 300)
+        ),
+    );
+
+    Some(ModelCheckResult {
+        api_base: api_base.to_string(),
+        model: model.to_string(),
+        should_continue: decision.should_continue,
+        reason,
+    })
+}
+
+/// Check with multiple AI models concurrently and use majority voting
+async fn check_with_ai(lines: &[TranscriptLine], config: &Config, logger: &DebugLogger) -> Option<(bool, String)> {
+    let active_providers = &config.providers;
+    let total_models: usize = active_providers.iter().map(|p| p.models.len()).sum();
+
+    logger.log(
+        "INFO",
+        format!(
+            "ai check start: providers={}, total_models={}, timeout={}s, lines={}",
+            active_providers.len(),
+            total_models,
+            config.timeout,
+            lines.len()
+        ),
+    );
+
+    if total_models == 0 {
+        logger.log("WARN", "no models configured; skipping ai check");
+        return None;
+    }
 
     let transcript_text = format_transcript_for_ai(lines);
     if transcript_text.is_empty() {
@@ -525,107 +697,119 @@ async fn check_with_ai(lines: &[TranscriptLine], config: &Config, logger: &Debug
         ),
     );
 
-    let request_body = serde_json::json!({
-        "model": config.model,
-        "messages": [
-            {
-                "role": "system",
-                "content": system_prompt
-            },
-            {
-                "role": "user",
-                "content": transcript_text
-            }
-        ],
-        "response_format": { "type": "json_object" },
-        "max_tokens": 256,
-        "temperature": 0
+    // Share data across tasks using Arc
+    let transcript_text = Arc::new(transcript_text);
+    let system_prompt = Arc::new(system_prompt.to_string());
+    let logger = Arc::new(DebugLogger {
+        enabled: logger.enabled,
+        log_path: logger.log_path.clone(),
+        run_id: logger.run_id.clone(),
     });
 
-    let url = format!("{}/chat/completions", config.api_base.trim_end_matches('/'));
+    // Spawn concurrent tasks for all models
+    let mut handles = Vec::with_capacity(total_models);
+    for provider in active_providers {
+        for model in &provider.models {
+            let api_base = provider.api_base.clone();
+            let api_key = provider.api_key.clone();
+            let model = model.clone();
+            let timeout = config.timeout;
+            let transcript_text = Arc::clone(&transcript_text);
+            let system_prompt = Arc::clone(&system_prompt);
+            let logger = Arc::clone(&logger);
+
+            handles.push(tokio::spawn(async move {
+                check_single_model(
+                    &transcript_text,
+                    &api_base,
+                    &api_key,
+                    &model,
+                    timeout,
+                    &system_prompt,
+                    &logger,
+                )
+                .await
+            }));
+        }
+    }
+
+    // Wait for all tasks to complete
+    let results = futures::future::join_all(handles).await;
+
+    // Collect votes
+    let mut continue_votes: Vec<ModelCheckResult> = Vec::new();
+    let mut stop_votes: Vec<ModelCheckResult> = Vec::new();
+    let mut failed = 0usize;
+
+    for result in results {
+        match result {
+            Ok(Some(check_result)) => {
+                if check_result.should_continue {
+                    continue_votes.push(check_result);
+                } else {
+                    stop_votes.push(check_result);
+                }
+            }
+            Ok(None) => {
+                failed += 1;
+            }
+            Err(e) => {
+                failed += 1;
+                logger.log("ERROR", format!("task join error: {}", e));
+            }
+        }
+    }
+
+    let continue_count = continue_votes.len();
+    let stop_count = stop_votes.len();
+    let ok_count = continue_count + stop_count;
 
     logger.log(
         "INFO",
-        format!("api request: POST {} (transcript_chars={})", url, transcript_text.len()),
+        format!(
+            "voting result: ok={}, failed={}, continue={}, stop={}",
+            ok_count, failed, continue_count, stop_count
+        ),
     );
 
-    let response = match client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", config.api_key))
-        .header("Content-Type", "application/json")
-        .json(&request_body)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Error: API request failed: {}", e);
-            logger.log("ERROR", format!("api request failed: {}", e));
-            return None;
-        }
-    };
-
-    logger.log("INFO", format!("api response status: {}", response.status()));
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        eprintln!("Error: API returned status {}: {}", status, body);
-        logger.log(
-            "ERROR",
-            format!("api returned status {} body={}", status, truncate_for_log(&body, 500)),
-        );
+    // If all requests failed, return None
+    if ok_count == 0 {
+        logger.log("WARN", "all model checks failed; allowing stop by default");
         return None;
     }
 
-    let body: serde_json::Value = match response.json().await {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("Error: failed to parse API response: {}", e);
-            logger.log("ERROR", format!("failed to parse API response json: {}", e));
-            return None;
-        }
-    };
+    // Majority vote: ties favor "Block" (should_continue=true)
+    // This is conservative - better to continue working than stop prematurely
+    let should_continue = continue_count >= stop_count;
 
-    let content = body
-        .pointer("/choices/0/message/content")
-        .and_then(|v| v.as_str())?;
+    // Build reason string with vote summary
+    let vote_summary = format!(
+        "vote: {}/{} continue, {}/{} stop",
+        continue_count, ok_count, stop_count, ok_count
+    );
 
-    logger.log("DEBUG", format!("model content={}", truncate_for_log(content, 500)));
-
-    // Parse response, handling various output formats (thinking tags, extra text, etc.)
-    let decision = match parse_ai_response(content) {
-        Some(d) => d,
-        None => {
-            eprintln!("Error: failed to parse AI response: {}", content);
-            logger.log(
-                "ERROR",
-                format!("failed to parse AI response content={}", truncate_for_log(content, 500)),
-            );
-            return None;
-        }
-    };
-
-    let reason = if decision.reason.is_empty() {
-        if decision.should_continue {
-            "AI determined task is incomplete".to_string()
-        } else {
-            "AI determined task is complete".to_string()
-        }
+    let winner_reason = if should_continue {
+        continue_votes
+            .first()
+            .map(|r| format!("[{} {}] {}", r.api_base, r.model, r.reason))
+            .unwrap_or_else(|| "AI determined task is incomplete".to_string())
     } else {
-        decision.reason
+        stop_votes
+            .first()
+            .map(|r| format!("[{} {}] {}", r.api_base, r.model, r.reason))
+            .unwrap_or_else(|| "AI determined task is complete".to_string())
     };
 
     logger.log(
         "INFO",
         format!(
-            "ai decision: should_continue={} reason={}",
-            decision.should_continue,
-            truncate_for_log(&reason, 300)
+            "final decision: should_continue={} ({})",
+            should_continue,
+            vote_summary
         ),
     );
 
-    Some((decision.should_continue, reason))
+    Some((should_continue, format!("{}; {}", vote_summary, winner_reason)))
 }
 
 // ============================================================================
@@ -664,9 +848,17 @@ async fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("Error: failed to load config from {:?}: {}", config_path, e);
             eprintln!("Please create a config file at {} with the following format:", DEFAULT_CONFIG_PATH);
             eprintln!();
-            eprintln!("api_base: https://api.openai.com/v1");
-            eprintln!("api_key: your-api-key-here");
-            eprintln!("model: gpt-4o-mini");
+            eprintln!("providers:");
+            eprintln!("  - api_base: https://api.openai.com/v1");
+            eprintln!("    api_key: your-openai-key");
+            eprintln!("    models:");
+            eprintln!("      - gpt-4o-mini");
+            eprintln!("      - gpt-4o");
+            eprintln!("  - api_base: https://api.deepseek.com/v1");
+            eprintln!("    api_key: your-deepseek-key");
+            eprintln!("    models:");
+            eprintln!("      - deepseek-chat");
+            eprintln!();
             eprintln!("timeout: 30  # optional");
             eprintln!("debug: false  # optional");
             return Err(e);
@@ -684,11 +876,17 @@ async fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         ),
     );
     logger.log("INFO", format!("config loaded from {:?}", config_path));
+
+    let active_providers = &config.providers;
+    let total_models: usize = active_providers.iter().map(|p| p.models.len()).sum();
     logger.log(
         "DEBUG",
         format!(
-            "config: api_base={}, model={}, timeout={}s, system_prompt_custom={}",
-            config.api_base, config.model, config.timeout, config.system_prompt.is_some()
+            "config: providers={}, models={}, timeout={}s, system_prompt_custom={}",
+            active_providers.len(),
+            total_models,
+            config.timeout,
+            config.system_prompt.is_some()
         ),
     );
 

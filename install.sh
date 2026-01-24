@@ -122,14 +122,11 @@ create_config() {
 # cc-goto-work configuration
 # https://github.com/pdxxxx/cc-goto-work
 
-# OpenAI compatible API base URL
-api_base: $api_base
-
-# API key for authentication
-api_key: $api_key
-
-# Model name to use
-model: $model
+providers:
+  - api_base: $api_base
+    api_key: $api_key
+    models:
+      - $model
 
 # Request timeout in seconds (optional)
 timeout: 30

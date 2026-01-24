@@ -214,14 +214,11 @@ function createConfig(apiBase, apiKey, model) {
   const configContent = `# cc-goto-work configuration
 # https://github.com/${REPO}
 
-# OpenAI compatible API base URL
-api_base: ${apiBase}
-
-# API key for authentication
-api_key: ${apiKey}
-
-# Model name to use
-model: ${model}
+providers:
+  - api_base: ${apiBase}
+    api_key: ${apiKey}
+    models:
+      - ${model}
 
 # Request timeout in seconds (optional)
 timeout: 30
